@@ -1,0 +1,247 @@
+
+--------------------- 所有路徑須在sudo root 中執行 路徑和運行文件都在root/Desktop 底下 ----------------
+sudo su
+
+docker pull ghcr.io/quic/cloud_ai_inference_ubuntu22:1.19.8.0
+
+(到http://qualcom-qpc-models.s3-website-us-east-1.amazonaws.com/QPC/catalog-index/#sdk-version-
+12012, 找尋需要的模型)
+
+wget https://qualcom-qpc-models.s3-accelerate.amazonaws.com/SDK1.19.6/meta-llama/Llama-3.3-70B-Instruct/qpc_16cores_128pl_8192cl_8fbs_8devices_mxfp6_mxint8.tar.gz
+
+tar -xvzf /qpc_home/qpc_16cores_128pl_8192cl_8fbs_8devices_mxfp6_mxint8.tar.gz -C /qpc_home/qpc
+
+pip install huggingface_hub
+(調用login登入, 輸入huggingface的token)
+
+當模型從官網下載後，會是類似qpc-8fb11380ed806bf4, 可將其改名變成模型名稱
+docker run -dit \
+-p 8000:8000 \
+--device=/dev/accel/accel0 \
+--device=/dev/accel/accel1 \
+--device=/dev/accel/accel2 \
+--device=/dev/accel/accel3 \
+-v ~/.cache/huggingface:/root/.cache/huggingface \
+-v ~/Desktop/qpc-8fb11380ed806bf4:/qpc_home/qpc-8fb11380ed806bf4 \
+-v ~/Desktop/script:/qpc_home/script \
+ghcr.io/quic/cloud_ai_inference_ubuntu22:1.19.8.0
+
+------------------------- 在docker中啟動後, 可直接到docker中運行script腳本 ---------------------
+啟動後可後續到container中
+docker exec -it <container_id> bash
+cd /qpc_home/script
+./start.sh
+
+
+------------------------- 在docker中啟動後, 如須單獨使用python啟動可以使用如下 ---------------------
+docker exec -it <container_id> bash
+chmod -R 777 /qpc_home
+source /opt/vllm-env/bin/activate
+pip install huggingface_hub
+(調用login登入, 輸入huggingface的token)
+
+export VLLM_QAIC_QPC_PATH=/qpc_home/qpc-8fb11380ed806bf4/qpc
+
+python3 -m vllm.entrypoints.openai.api_server \
+--host 0.0.0.0 \
+--port 8000 \
+--model meta-llama/Llama-3.3-70B-Instruct \
+--max-model-len 8192 \
+--max-num-seq 1 \
+--max-seq_len-to-capture 128 \
+--device qaic \
+--quantization mxfp6 \
+--kv-cache-dtype mxint8 \
+--device-group 0,1,2,3
+
+
+------------------------  檢查我的高通卡指令 ---------------
+sudo /opt/qti-aic/tools/qaic-util --table 1
+
+------------------------  我的start.sh:  (chmod +x /start.sh) -----------------
+#!/bin/bash
+
+# 激活虛擬環境
+chmod -R 777 /qpc_home
+source /opt/vllm-env/bin/activate
+
+# 設置環境變數
+ulimit -n 1048576
+export OMP_NUM_THREADS=8
+export VLLM_QAIC_QPC_PATH=/qpc_home/qpc-8fb11380ed806bf4/qpc
+
+# 啟動 vLLM 服務並在背景運行，輸出日誌到 nohup.out
+nohup python3 -m vllm.entrypoints.openai.api_server \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --model meta-llama/Llama-3.3-70B-Instruct \
+  --max-model-len 8192 \
+  --max-num-seq 1 \
+  --max-seq_len-to-capture 128 \
+  --device qaic \
+  --quantization mxfp6 \
+  --kv-cache-dtype mxint8 \
+  --device-group 0,1,2,3 \
+  > nohup.out 2>&1 &
+
+# 保存進程 ID 到 vllm.pid
+echo $! > /root/vllm.pidtail
+
+echo "vLLM 服務已啟動，PID: $(cat /root/vllm.pid)"
+echo "日誌輸出到 /root/nohup.out"
+
+--------------------  我的stop.sh: (chmod +x ./stop.sh) ----------------------
+#!/bin/bash
+
+# 函數：獲取進程組 ID
+get_pgid() {
+  local pid=$1
+  ps -o pgid= -p "$pid" | tr -d ' '
+}
+
+# 函數：釋放 QAIC 資源
+release_qaic_resources() {
+  echo "--------------------------------------------------"
+  echo "正在釋放 Qualcomm AI Cloud (QAIC) 卡的資源..."
+  
+  if ! command -v qaic-util &> /dev/null; then
+    echo "警告：未找到 'qaic-util' 命令，無法重置 QAIC 卡。"
+    return 1
+  fi
+
+  echo "執行命令: qaic-util -r -d all"
+  qaic-util -r -d all
+  
+  if [ $? -eq 0 ]; then
+    echo "成功重置所有 QAIC 卡，資源已釋放。"
+  else
+    echo "錯誤：QAIC 卡重置失敗。"
+    return 1
+  fi
+  echo "--------------------------------------------------"
+}
+
+# 函數：清理指定進程組中的所有進程
+cleanup_child_processes() {
+  local pgid=$1
+  local main_pid=$2
+  
+  echo "正在查找並清理進程組 (PGID: $pgid) 中的所有進程..."
+  
+  local all_pids_in_group
+  all_pids_in_group=$(pgrep -g "$pgid")
+  
+  if [ -z "$all_pids_in_group" ]; then
+    echo "在進程組 $pgid 中未找到任何進程。"
+    return
+  fi
+  
+  local has_processes_to_kill=false
+  for pid in $all_pids_in_group; do
+    has_processes_to_kill=true
+    echo "  -> 正在終止進程 (PID: $pid)..."
+    kill -15 "$pid" 2>/dev/null  # 先嘗試 SIGTERM
+    sleep 0.5
+    if ps -p "$pid" > /dev/null; then
+      echo "  -> SIGTERM 無效，嘗試 SIGKILL (PID: $pid)..."
+      kill -9 "$pid" 2>/dev/null
+    fi
+  done
+
+  if ! $has_processes_to_kill; then
+    echo "進程組中沒有需要清理的進程。"
+  else
+    echo "進程組清理完畢。"
+  fi
+}
+
+# 函數：檢查殞留的 Python 進程
+check_residual_processes() {
+  echo "檢查是否有殞留的 Python3 進程..."
+  local residual_pids
+  residual_pids=$(ps aux | grep '[p]ython3' | grep -v 'grep' | awk '{print $2}')
+  if [ -z "$residual_pids" ]; then
+    echo "✅ 無殞留的 Python3 進程。"
+  else
+    echo "⚠️ 檢測到殞留的 Python3 進程："
+    ps aux | grep '[p]ython3' | grep -v 'grep'
+    echo "嘗試強制清理所有 /opt/vllm-env/bin/python3 進程..."
+    pkill -9 -f "/opt/vllm-env/bin/python3" 2>/dev/null
+    sleep 1
+    if ps aux | grep '[p]ython3' | grep -v 'grep' > /dev/null; then
+      echo "❌ 仍無法清理所有 Python3 進程，建議檢查系統狀態或重啟伺服器。"
+      return 1
+    else
+      echo "✅ 所有殞留 Python3 進程已清理。"
+    fi
+  fi
+}
+
+# 主要邏輯
+main() {
+  local PID
+  local PGID
+
+  echo "正在查找 vLLM 主進程..."
+  PID=$(pgrep -f "python3 -m vllm.entrypoints.openai.api_server")
+
+  echo "顯示釋放 QAIC 前記憶體狀態："
+  free -h
+
+  # 1. 優先重置 QAIC 硬體資源
+  release_qaic_resources
+  sleep 1
+
+  echo "顯示釋放 QAIC 後記憶體狀態："
+  free -h
+
+  if [ -z "$PID" ]; then
+    echo "未找到正在運行的 vLLM 服務。"
+    # 檢查是否有其他殞留的 Python3 進程
+    check_residual_processes
+    echo "腳本執行完畢。"
+    exit 0
+  else
+    PGID=$(get_pgid "$PID")
+    echo "找到 vLLM 服務 (PID: $PID, PGID: $PGID)，準備清理..."
+
+    # 2. 清理進程組中的所有進程（包括主進程和子進程）
+    cleanup_child_processes "$PGID" "$PID"
+    sleep 1
+
+    # 3. 檢查主進程是否仍存在
+    if ps -p "$PID" > /dev/null; then
+      echo "⚠️ 主進程 (PID: $PID) 仍未終止，嘗試使用 pkill 強制清理..."
+      pkill -9 -f "python3 -m vllm.entrypoints.openai.api_server" 2>/dev/null
+      sleep 1
+    fi
+
+    # 4. 最終檢查殞留進程
+    check_residual_processes
+    if [ $? -ne 0 ]; then
+      echo "=========================== 警告 ==========================="
+      echo "❌ 無法完全清理 vLLM 相關進程。"
+      echo "這極有可能是驅動程式或核心問題導致的。"
+      echo "強烈建議您立即重新啟動 ('reboot') 伺服器以恢復正常狀態。"
+      echo "=========================================================="
+      exit 1
+    fi
+
+    # 5. 清理 PID 文件
+    rm -f /root/vllm.pid
+    echo "✅ vLLM 進程及相關資源已成功清理。"
+
+    # 6. 顯示最終記憶體狀態
+    echo "顯示最終記憶體狀態："
+    free -h
+  fi
+
+  echo "腳本執行完畢。"
+  exit 0
+}
+
+# 執行主函數
+main
+
+---------------------------------- 查看是否啟動的端口 -----------------------
+curl http://localhost:8000/v1/models
